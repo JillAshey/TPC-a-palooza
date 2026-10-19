@@ -1,0 +1,164 @@
+---
+title: "TPC stepwise"
+author: "Jill Ashey"
+date: "2026-10-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(LoLinR)
+library(purrr)
+library(furrr)
+library(fuzzyjoin)
+```
+
+
+
+## A - stepwise TPC
+
+Initial data processing and plotting by JA on 10/14/26. Using [code](https://github.com/JillAshey/PI_TPC/blob/main/scripts/TPC_Photosynthesis.Rmd) from 2025 TPC paper as reference. 
+
+### Functions for analysis 
+
+```{r}
+sharpe_schoolfield <- function(lnc, E, Eh, Th, temp, Tc) {
+  Tc <- 273.15 + Tc
+  k <- 8.62e-5
+  boltzmann.term <- lnc + log(exp(E/k*(1/Tc - 1/temp))) # units are eV/K, electrovolts/Kelvin
+  inactivation.term <- log(1/(1 + exp(Eh/k*(1/Th - 1/temp))))
+  return(boltzmann.term + inactivation.term)}
+
+get_topt <- function(E, Th, Eh){
+  k <- 8.62e-05
+  return((Eh * Th) / (Eh + (k * Th * log((Eh / E) - 1))))}
+
+get_tpc_ci <- function(model, new_data) {
+  # predictNLS calculates the intervals based on the Taylor expansion (Delta Method)
+  pred <- predictNLS(model, newdata = new_data, interval = "confidence", alpha = 0.05)
+  return(as.data.frame(pred$summary))}
+```
+
+### Prep data 
+
+Load run metadata 
+```{r}
+run_meta <- read_csv("../data/A_stepwise/run_metadata_stepwise.csv") %>%
+  mutate(
+    Start = as_datetime(Date) + hours(hour(Start.time)) + minutes(minute(Start.time)),
+    Stop  = as_datetime(Date) + hours(hour(Stop.time)) + minutes(minute(Stop.time)))
+```
+
+Load sample metadata 
+```{r}
+sample_meta <- read_csv("../data/A_stepwise/sample_metadata_stepwise.csv")
+
+# Make sure Chamber well # is numeric
+sample_meta <- sample_meta %>%
+  mutate(`Chamber` = as.numeric(`Chamber`))
+```
+
+List all raw files for Sept 2023 
+```{r}
+files <- list.files(path = "../data/A_stepwise/raw_data/", pattern = "*.csv", full.names = TRUE)
+```
+
+Join O2 data with metadata files based on start and stop times 
+```{r}
+all_data <- map_dfr(files, function(f) {
+  # Extract channel number from filename, e.g. Ch1 → 1
+  channel <- str_extract(f, "Ch\\d+") %>% str_remove("Ch") %>% as.numeric()
+  
+  # Read the file
+  raw <- read_csv(f) %>%
+    mutate(
+      # Parse datetime (adjust format if needed)
+      DateTime = dmy_hms(Date),
+      Channel = channel
+    )
+  
+  # Join to run metadata by fuzzy time match
+  raw_joined <- fuzzy_left_join(
+    raw,
+    run_meta,
+    by = c("DateTime" = "Start", "DateTime" = "Stop"),
+    match_fun = list(`>=`, `<=`)
+  )
+  
+  # Join to sample metadata by Date, Run #, and Channel
+  raw_joined <- raw_joined %>%
+    left_join(
+      sample_meta,
+      by = c(
+        "Date.y" = "Date",
+        "Run" = "Run",
+        "Channel" = "Chamber"
+      )
+    )
+  
+  return(raw_joined)
+})
+```
+
+Remove any time errors in the data. For this dataset specifically:
+
+- For all temps: remove first ~3 mins (time when coral was acclimating to being handled)
+- For temp 25: Remove the last ~30 mins of channel 9! The probe came out halfway through and I did not notice until end of run
+- For temp 34: Remove the last 30 seconds of this run for all probes. I pulled out probes before stopping software
+- Remove any rows with sampleID as NA
+```{r}
+cleaned_data <- all_data %>%
+  filter(!is.na(SampleID)) %>%
+  group_by(Run, Channel, SampleID) %>%
+  filter(`Delta T [min]` >= 3) %>% # acclimation time
+  filter(!(Target_Temperature == 25 & Channel == 9 & `Delta T [min]` > (max(`Delta T [min]`) - 30))) %>%
+  filter(!(Target_Temperature == 34 & `Delta T [min]` > (max(`Delta T [min]`) - 0.5))) %>%
+  ungroup()
+```
+
+Save raw combined data
+```{r}
+write.csv("../output/A_stepwise/A_all_joined_data.csv")
+```
+
+### Run localized linear regressions 
+
+The interval fitting code is computationally intense.
+
+Make list of all SampleID / Run combinations (including blanks)
+```{r}
+sample_runs <- cleaned_data %>%
+  filter(!is.na(SampleID)) %>%
+  distinct(SampleID, Run)
+```
+
+Calculate interval slopes for blanks
+```{r}
+blank_data <- cleaned_data %>%
+  filter(SampleID == "blank")
+
+blank_intervals <- blank_data %>%
+  dplyr::group_by(Run, Temperature.y) %>%
+  dplyr::filter(!is.na(SampleID)) %>%
+  dplyr::group_split()
+```
+
+Fit regressions and extract slopes for each blank interval
+```{r}
+# regression function
+fit_reg <- function(df) {
+  rankLocReg(
+    xall = as.numeric(df$`Delta T [min]`),
+    yall = df$Oxygen,
+    alpha = 0.2,
+    method = "pc",
+    verbose = FALSE
+  )
+}
+
+# Fit regressions and get slopes for each blank by run and temperature
+blank_fits <- map(blank_intervals, fit_reg)
+blank_slopes <- map_dbl(blank_fits, ~ pluck(., "allRegs", "b1", 1))
+```

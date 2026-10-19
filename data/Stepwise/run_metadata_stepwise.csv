@@ -1,0 +1,8 @@
+Date,Run,Temperature,Start.time,Stop.time,Notes
+2026-10-14,1,18,9:31,10:17,All temps should be checked on logger/computer. Temps tended to trend higher than the set temps 
+2026-10-14,2,22,10:37,11:26,
+2026-10-14,3,25,11:45,12:35,do not use the last ~30 mins of channel 9! The probe came out halfway through and I did not notice until end of run
+2026-10-14,4,28,13:01,13:49,
+2026-10-14,5,31,14:22,15:09,
+2026-10-14,6,34,15:34,16:24,Don't use last 30 seconds of this run for all probes. Pulled out probes before stopping software
+2026-10-14,7,38,16:49,17:34,
