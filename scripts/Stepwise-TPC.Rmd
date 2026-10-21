@@ -13,6 +13,8 @@ library(LoLinR)
 library(purrr)
 library(furrr)
 library(fuzzyjoin)
+library(readr)
+library(nls.multstart)
 ```
 
 ## Stepwise TPC
@@ -116,11 +118,6 @@ cleaned_data <- all_data %>%
   ungroup()
 ```
 
-Save raw combined data
-```{r}
-#write.csv("../output/Stepwise/all_joined_data.csv")
-```
-
 ### Run localized linear regressions 
 
 The interval fitting code is computationally intense.
@@ -137,25 +134,12 @@ Calculate interval slopes for blanks
 blank_data <- cleaned_data %>%
   filter(SampleID == "blank")
 
-blank_intervals <- blank_data %>%
-  dplyr::group_by(Run, Temperature.y) %>%
+blank_intervals_thinned <- blank_data %>%
   dplyr::filter(!is.na(SampleID)) %>%
+  dplyr::group_by(Run, Temperature.y) %>%
+  dplyr::slice(seq(1, n(), by = 5)) %>% # Thin data 
   dplyr::group_split()
 ```
-
-```{r}
-fit_reg <- function(df) {
-  cat(sprintf("Fitting blank: Run %s | Temp %s...\n", 
-              unique(df$Run), 
-              unique(df$Temperature.y)))  rankLocReg( xall = as.numeric(df$`Delta T [min]`),
-    yall = df$Oxygen,
-    alpha = 0.2,
-    method = "pc",
-    verbose = FALSE
-  )
-}
-```
-
 
 Fit regressions and extract slopes for each blank interval
 ```{r}
@@ -172,13 +156,13 @@ fit_reg <- function(df) {
 
 # Fit regressions for each blank interval
 plan(multisession)
-blank_fits <- future_map(blank_intervals, fit_reg, .options = furrr_options(seed = TRUE))
+blank_fits <- future_map(blank_intervals_thinned, fit_reg, .options = furrr_options(seed = TRUE))
 #blank_fits <- map(blank_intervals, fit_reg)
 blank_slopes <- map_dbl(blank_fits, ~ pluck(., "allRegs", "b1", 1))
 
 # Create a summary table mapped by Run & Temperature
 blank_summary <- map2_dfr(
-  blank_intervals,
+  blank_intervals_thinned,
   blank_slopes,
   ~ tibble(
     Run = unique(.x$Run),
@@ -186,4 +170,292 @@ blank_summary <- map2_dfr(
     Blank_Slope = .y
   )
 )
+```
+
+Fit regressions for each interval/samples
+```{r}
+# Thin sample data (take 1 of every 5 rows to prevent rankLocReg bottleneck)
+thinned_data <- cleaned_data %>%
+  group_by(SampleID, Run, Temperature.y) %>%
+  slice(seq(1, n(), by = 5)) %>%
+  ungroup()
+
+# Define interval fitting function matching Run & Temperature blanks
+fit_colony_intervals_runblank <- function(colony_id, run_num) {
+  # Subset sample data for specific colony & run
+  sample_data <- thinned_data %>%
+    filter(SampleID == colony_id, Run == run_num)
+  
+  if (nrow(sample_data) == 0) return(NULL)
+  
+  # Split data by temperature interval
+  intervals <- sample_data %>%
+    group_by(Temperature.y) %>%
+    group_split()
+  
+  # Fit regressions
+  fits <- map(intervals, fit_reg)
+  micromol.L.s <- map_dbl(fits, ~ pluck(., "allRegs", "b1", 1))
+  
+  # Build detailed summary
+  interval_df <- map2_dfr(
+    intervals,
+    seq_along(intervals),
+    ~ tibble(
+      SampleID    = colony_id,
+      Run         = run_num,
+      Interval    = .y,
+      Temperature = unique(.x$Temperature.y),
+      N_points    = nrow(.x),
+      O2_start    = head(.x$Oxygen, 1),
+      O2_end      = tail(.x$Oxygen, 1), DeltaT_min  = min(.x$`Delta T [min]`),
+      DeltaT_max  = max(.x$`Delta T [min]`),
+      O2_min      = min(.x$Oxygen, na.rm = TRUE),
+      O2_max      = max(.x$Oxygen, na.rm = TRUE),
+      Slope       = micromol.L.s[.y]
+    )
+  ) %>%
+    # Match the specific blank for specific Run and Temperature
+    left_join(blank_summary, by = c("Run", "Temperature")) %>%
+    mutate(
+      Blank_Corrected_Slope = Slope - Blank_Slope
+    )
+  
+  # Write individual sample CSVs
+  fn <- paste0("../output/Stepwise/intervals_", colony_id, "_run", run_num, ".csv")
+  write_csv(interval_df, fn)
+  
+  interval_df
+}
+
+# Run parallelized execution for all samples
+plan(multisession)
+
+# Build run pairs list excluding blank entries
+colony_runs_clean <- thinned_data %>%
+  filter(!is.na(SampleID), SampleID != "blank") %>%
+  distinct(SampleID, Run)
+
+all_interval_summaries <- future_pmap_dfr(
+  list(colony_runs_clean$SampleID, colony_runs_clean$Run),
+  fit_colony_intervals_runblank
+)
+
+# Export final combined results
+write_csv(all_interval_summaries, "../output/Stepwise/all_interval_summaries.csv")
+
+getwd()
+```
+
+Read data in so I don't have to run above chunk again 
+```{r}
+all_int_tpc <- read_csv("../output/Stepwise/all_interval_summaries.csv")
+
+all_int_tpc$SampleID <- as.character(all_int_tpc$SampleID)
+```
+
+Merge sample metadata with interval data 
+```{r}
+all_int_tpc <- all_int_tpc %>%
+  inner_join(sample_meta, by = c("SampleID" = "SampleID", "Temperature" = "Target_Temperature"))
+```
+
+Normalize interval data by chamber volume and surface area and save. Since I don't have the surface area yet, normalized to 15cm2 for all fragments. 
+```{r}
+all_int_tpc <- all_int_tpc %>%
+  mutate(
+    Chamber_Volume_L = Chamber_Volume_mL / 1000,  # mL → L
+    Slope_norm = (Blank_Corrected_Slope * Chamber_Volume_L / 15) * 60) # units are umol O2 cm-2 h-1
+write.csv(all_int_tpc, "../output/Stepwise/all_interval_summaries_normalized.csv")
+```
+
+Multiply by -1 so values are positive 
+```{r}
+all_int_tpc <- all_int_tpc %>%
+  mutate(Slope_norm_pos = -1 * Slope_norm)
+```
+
+Plot curves across temperatures
+```{r}
+ggplot(all_int_tpc, aes(x = Temperature, y = Slope_norm_pos)) +
+  geom_hline(yintercept = 0, alpha = 0.5, linetype = "dashed") +
+  geom_point() +
+  geom_line(aes(group = SampleID)) + 
+  #scale_color_manual(
+  #  values = c("Resistant" = "#4b294fff", "Susceptible" = "#f3a17dff")) +
+  #facet_wrap(~Species, scales = "fixed") +
+  theme_classic(base_size = 14) +
+  labs(x = "Temperature (C)", y = "umol O2 cm-2 h-1")
+
+ggplot(all_int_tpc, aes(x = Temperature, y = Slope_norm_pos)) +
+  geom_hline(yintercept = 0, alpha = 0.5, linetype = "dashed") +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 1.2) +
+  labs(x = "Temperature (C)", y = "umol O2 cm-2 h-1") + 
+  theme_classic()
+```
+
+## Fit TPC curve 
+
+Set target temperature to numeric and convert temperature to Kelvin
+```{r}
+all_int_tpc <- all_int_tpc %>%
+  mutate(
+    Temperature = as.numeric(Temperature),
+    Temperature.K = Temperature + 273.15,
+    log.rate = log(Slope_norm_pos)) # take log of positive rate 
+```
+
+Fit curves for all colonies using `sharpe_schoolfield` function defined above
+```{r}
+fits <- all_int_tpc %>%
+  group_by(SampleID) %>%
+  nest() %>%
+  mutate(fit = purrr::map(data, ~ nls_multstart(
+    log.rate ~ sharpe_schoolfield(lnc, E, Eh, Th, temp = Temperature.K, Tc = 27),
+    data = .x,
+    iter = 1000,
+    start_lower = c(lnc = -5, E = 0.2, Eh = 0.5, Th = 290),
+    start_upper = c(lnc = 5,  E = 1.2, Eh = 4.0, Th = 315),
+    lower       = c(lnc = -10, E = 0.05, Eh = 0.1, Th = 273.15),
+    upper       = c(lnc = 10,  E = 3.0,  Eh = 10,  Th = 350),
+    supp_errors = 'Y',
+    na.action   = na.omit
+  )))
+```
+
+Extract fit parameters
+```{r}
+params <- fits %>%
+  mutate(coefs = map(fit, tidy)) %>%
+  select(SampleID, coefs) %>%
+  unnest(coefs)
+```
+
+Calculate Topt and Rmax for each colony 
+```{r}
+Topt_Rmax <- params %>%
+  select(SampleID, term, estimate) %>%
+  pivot_wider(names_from = term, values_from = estimate) %>%
+  mutate(
+    Topt_K = get_topt(E, Th, Eh),
+    Topt_C = Topt_K - 273.15,
+    Rmax_log = sharpe_schoolfield(lnc, E, Eh, Th, temp = Topt_K, Tc = 27),
+    Rmax_linear = exp(Rmax_log))
+```
+
+Pivot data so that each trait is a row 
+```{r}
+traits_long <- Topt_Rmax %>%
+  dplyr::select(SampleID, lnc, E, Eh, Topt_C, Rmax_log, Rmax_linear) %>%
+  pivot_longer(cols = c(lnc, E, Eh, Topt_C, Rmax_log, Rmax_linear), 
+               names_to = "trait", 
+               values_to = "estimate") %>%
+  mutate(Type = "Stepwise")
+```
+
+Save as csv
+```{r}
+write.csv(traits_long, "../output/Stepwise/Stepwise_TPC_metrics.csv")
+```
+
+Plot each sample
+```{r}
+ggplot(traits_long, aes(y = estimate, x = Type)) +
+  # Add raw colony data as small, transparent points to show the spread
+  geom_jitter(width = 0.1, alpha = 0.3, size = 1.5) +
+  stat_summary(fun = mean, geom = "point", size = 4) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, linewidth = 1) +
+  theme_bw() +
+  facet_wrap(~trait, scales = "free_y") +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "white"),
+    strip.text = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(face = "bold", size = 13),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "2026 Stepwise Thermal Performance Traits",
+    y = "Estimate (Mean +/- SEM)",
+    x = ""
+  )
+
+## Box plot 
+ggplot(traits_long, aes(x = Type, y = estimate)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.6, color = "black") +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1.2, color = "black") +
+  facet_wrap(~trait, scales = "free_y") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "white"),
+    strip.text = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(face = "bold", size = 13),
+    panel.grid.major.x = element_blank() # Clean up vertical lines
+  ) +
+  labs(
+    y = "Estimated Parameter Value",
+    x = ""
+  )
+```
+
+Plot with confidence intervals 
+```{r}
+# Define the temperature range for the smooth curves
+new_data <- data.frame(
+  Temperature.K = seq(18 + 273.15 - 1,  # 17°C
+                      38 + 273.15 + 1,  # 39°C
+                      length.out = 200))
+
+# Generate predictions for every model -- This creates a "long" dataframe of all potential curves
+preds_all <- fits %>%
+  mutate(preds = map(fit, ~{
+    p <- try(predict(.x, newdata = new_data), silent = TRUE)
+    if(inherits(p, "try-error")) return(NULL)
+    data.frame(Temperature.K = new_data$Temperature.K, pred_val = p)
+  })) %>%
+  filter(!map_lgl(preds, is.null)) %>% # Remove failed fits
+  unnest(preds)
+
+# Calculate the mean and CI of the curves per temp
+# At each temperature step, find the mean performance across all samples
+preds_mean_summary <- preds_all %>%
+  group_by(Temperature.K) %>%
+  dplyr::summarise(
+    mean_val = mean(pred_val, na.rm = TRUE),
+    sd_val = sd(pred_val, na.rm = TRUE),
+    n = n(),
+    se_val = sd_val / sqrt(n),
+    # 95% Confidence Interval of the Mean
+    lower = mean_val - (1.96 * se_val),
+    upper = mean_val + (1.96 * se_val),
+    .groups = "drop"
+  )
+```
+
+Plot TPC with fitted curves 
+```{r}
+ggplot(preds_mean_summary, aes(x = Temperature.K - 273.15, y = mean_val)) +
+  geom_hline(yintercept = 0, alpha = 0.5, linetype = "dashed") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.5, color = NA) +
+  geom_line(linewidth = 1.5) +
+  scale_x_continuous(
+    breaks = seq(18, 40, by = 2), 
+    limits = c(17, 40)) +
+  geom_point(data = all_int_tpc, aes(x = Temperature.K - 273.15, y = log.rate), 
+             alpha = 0.2, size = 1, inherit.aes = TRUE) +
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = "Temperature (°C)", 
+    y = expression(bold("Respiration (log(" *mu*"mol " *cm^-2 *hr^-1*"))")),
+    title = "Respiration stepwise Fitted Thermal Performance Curves (2026)"
+  )
 ```

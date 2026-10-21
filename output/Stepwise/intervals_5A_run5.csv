@@ -1,0 +1,2 @@
+SampleID,Run,Interval,Temperature,N_points,O2_start,O2_end,DeltaT_min,DeltaT_max,O2_min,O2_max,Slope,Blank_Slope,Blank_Corrected_Slope
+5A,5,1,31,187,192.48,174.394,291.651,338.147,174.394,192.48,-0.34752835945664456,-0.01676668195246939,-0.3307616775041752
