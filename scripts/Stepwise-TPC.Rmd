@@ -15,9 +15,7 @@ library(furrr)
 library(fuzzyjoin)
 ```
 
-
-
-## A - stepwise TPC
+## Stepwise TPC
 
 Initial data processing and plotting by JA on 10/14/26. Using [code](https://github.com/JillAshey/PI_TPC/blob/main/scripts/TPC_Photosynthesis.Rmd) from 2025 TPC paper as reference. 
 
@@ -45,7 +43,7 @@ get_tpc_ci <- function(model, new_data) {
 
 Load run metadata 
 ```{r}
-run_meta <- read_csv("../data/A_stepwise/run_metadata_stepwise.csv") %>%
+run_meta <- read_csv("../data/Stepwise/run_metadata_stepwise.csv") %>%
   mutate(
     Start = as_datetime(Date) + hours(hour(Start.time)) + minutes(minute(Start.time)),
     Stop  = as_datetime(Date) + hours(hour(Stop.time)) + minutes(minute(Stop.time)))
@@ -53,7 +51,7 @@ run_meta <- read_csv("../data/A_stepwise/run_metadata_stepwise.csv") %>%
 
 Load sample metadata 
 ```{r}
-sample_meta <- read_csv("../data/A_stepwise/sample_metadata_stepwise.csv")
+sample_meta <- read_csv("../data/Stepwise/sample_metadata_stepwise.csv")
 
 # Make sure Chamber well # is numeric
 sample_meta <- sample_meta %>%
@@ -62,7 +60,7 @@ sample_meta <- sample_meta %>%
 
 List all raw files for Sept 2023 
 ```{r}
-files <- list.files(path = "../data/A_stepwise/raw_data/", pattern = "*.csv", full.names = TRUE)
+files <- list.files(path = "../data/Stepwise/raw_data/", pattern = "*.csv", full.names = TRUE)
 ```
 
 Join O2 data with metadata files based on start and stop times 
@@ -120,7 +118,7 @@ cleaned_data <- all_data %>%
 
 Save raw combined data
 ```{r}
-write.csv("../output/A_stepwise/A_all_joined_data.csv")
+#write.csv("../output/Stepwise/all_joined_data.csv")
 ```
 
 ### Run localized linear regressions 
@@ -145,6 +143,20 @@ blank_intervals <- blank_data %>%
   dplyr::group_split()
 ```
 
+```{r}
+fit_reg <- function(df) {
+  cat(sprintf("Fitting blank: Run %s | Temp %s...\n", 
+              unique(df$Run), 
+              unique(df$Temperature.y)))  rankLocReg( xall = as.numeric(df$`Delta T [min]`),
+    yall = df$Oxygen,
+    alpha = 0.2,
+    method = "pc",
+    verbose = FALSE
+  )
+}
+```
+
+
 Fit regressions and extract slopes for each blank interval
 ```{r}
 # regression function
@@ -158,7 +170,20 @@ fit_reg <- function(df) {
   )
 }
 
-# Fit regressions and get slopes for each blank by run and temperature
-blank_fits <- map(blank_intervals, fit_reg)
+# Fit regressions for each blank interval
+plan(multisession)
+blank_fits <- future_map(blank_intervals, fit_reg, .options = furrr_options(seed = TRUE))
+#blank_fits <- map(blank_intervals, fit_reg)
 blank_slopes <- map_dbl(blank_fits, ~ pluck(., "allRegs", "b1", 1))
+
+# Create a summary table mapped by Run & Temperature
+blank_summary <- map2_dfr(
+  blank_intervals,
+  blank_slopes,
+  ~ tibble(
+    Run = unique(.x$Run),
+    Temperature = unique(.x$Temperature.y),
+    Blank_Slope = .y
+  )
+)
 ```
