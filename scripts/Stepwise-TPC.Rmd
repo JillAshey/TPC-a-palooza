@@ -15,9 +15,11 @@ library(furrr)
 library(fuzzyjoin)
 library(readr)
 library(nls.multstart)
+library(rTPC)
+library(broom)
 ```
 
-## Stepwise TPC
+# Stepwise TPC
 
 Initial data processing and plotting by JA on 10/14/26. Using [code](https://github.com/JillAshey/PI_TPC/blob/main/scripts/TPC_Photosynthesis.Rmd) from 2025 TPC paper as reference. 
 
@@ -459,3 +461,337 @@ ggplot(preds_mean_summary, aes(x = Temperature.K - 273.15, y = mean_val)) +
     title = "Respiration stepwise Fitted Thermal Performance Curves (2026)"
   )
 ```
+
+
+# Stepwise TPC with rTPC
+
+Read in normalized interval data 
+```{r}
+ints <- read.csv("../output/Stepwise/all_interval_summaries_normalized.csv", header = T)
+```
+
+Multiply by -1 so values are positive 
+```{r}
+ints <- ints %>%
+  mutate(rate = -1 * Slope_norm) %>%
+  rename(temp = Temperature)
+```
+
+Trying initial steps from rTPC website 
+```{r}
+# choose model
+mod = 'sharpschoolhigh_1981'
+
+# get start vals
+start_vals <- get_start_vals(
+  ints$temp,
+  ints$rate,
+  model_name = 'sharpeschoolhigh_1981'
+)
+
+# get limits
+low_lims <- get_lower_lims(ints$temp, ints$rate, model_name = 'sharpeschoolhigh_1981')
+upper_lims <- get_upper_lims(
+  ints$temp,
+  ints$rate,
+  model_name = 'sharpeschoolhigh_1981')
+
+# Fit model 
+fit <- nls_multstart(
+  rate ~ sharpeschoolhigh_1981(temp = temp, r_tref, e, eh, th, tref = 27),
+  data = ints,
+  iter = 500,
+  start_lower = start_vals - 10,
+  start_upper = start_vals + 10,
+  lower = low_lims,
+  upper = upper_lims,
+  supp_errors = 'Y',
+  lhstype = 'random'
+)
+fit
+calc_params(fit) %>%
+  mutate_all(round, 2)
+
+# Predict new data 
+new_data <- data.frame(temp = seq(min(ints$temp), max(ints$temp), 0.5))
+preds <- augment(fit, newdata = new_data)
+
+# plot data and model fit
+ggplot(ints, aes(temp, rate)) +
+  geom_point() +
+  geom_line(aes(temp, .fitted), preds, col = 'blue') +
+  theme_bw(base_size = 12) +
+  labs(
+    x = 'Temperature (ºC)',
+    y = 'Metabolic rate',
+    title = 'Respiration across temperatures'
+  )
+```
+
+Okay this worked! Ford sent me some code that will iteratively test the data with each model so going to try to run that now. 
+```{r}
+#49 models in the package — requires columns named rate and temp 
+#limits and start vals are set for all individuals in a dataset, so this runs pretty effectively for bulk data but may need to be tuned for individual corals in subsequent runs per ID that have very different overall rates
+#this code siliently skips anything that errors out (e.g. Sharpe schoolfield because of the tref), so your AIC list at the end will be shorter than 49.
+
+aic_comparison_step<-data.frame(model=character(),aic=numeric())
+for (i in c(1:49)){
+  mod<-get_model_names()[i]
+  params<-  setdiff(names(formals(get(mod, asNamespace("rTPC")))), "temp");params
+  start_vals <- get_start_vals(ints$temp, ints$rate, model_name = mod)
+  low_lims <- get_lower_lims(ints$temp, ints$rate, model_name = mod)
+  upper_lims <- get_upper_lims(ints$temp, ints$rate, model_name = mod)
+  formula <- as.formula(paste("rate ~",sprintf("%s(temp = temp, %s)",mod,paste(params, collapse = ", "))));formula
+
+  fit <- try(nls_multstart(formula,
+                           data = ints,
+                           iter = 500,
+                           start_lower = start_vals - 10,
+                           start_upper = start_vals + 10,
+                           lower = low_lims,
+                           upper = upper_lims,
+                           supp_errors = 'Y'),    silent = TRUE)
+  if (inherits(fit, "try-error") || is.null(fit)) {
+    next
+  }
+
+  aic_comparison_step <- aic_comparison_step %>%
+    bind_rows(tibble(model = mod, aic = AIC(fit))) %>%
+    arrange(aic) %>%
+    distinct()
+};beepr::beep()
+
+mod_step<-aic_comparison_step%>%slice_min(aic)%>%pull(model);head(aic_comparison_step)
+```
+
+Calculate TPC parameters using best fit model
+```{r}
+# Identify the top-performing model name from comparison table
+best_model_name <- aic_comparison %>% 
+  slice_min(aic) %>% 
+  pull(model)
+
+# Extract model arguments and parameters 
+params <- setdiff(names(formals(get(best_model_name, asNamespace("rTPC")))), c("temp", "tref"))
+
+# Get model bounds and start values
+start_vals <- get_start_vals(ints$temp, ints$rate, model_name = best_model_name)
+low_lims   <- get_lower_lims(ints$temp, ints$rate, model_name = best_model_name)
+upper_lims <- get_upper_lims(ints$temp, ints$rate, model_name = best_model_name)
+if ("tref" %in% names(formals(get(best_model_name, asNamespace("rTPC"))))) {
+  param_str <- paste(c(params, "tref = 25"), collapse = ", ")
+} else {
+  param_str <- paste(params, collapse = ", ")
+}
+best_formula <- as.formula(sprintf("rate ~ %s(temp = temp, %s)", best_model_name, param_str))
+
+# Refit the best model
+fit_best <- nls_multstart(
+  best_formula,
+  data = ints,
+  iter = 500,
+  start_lower = pmax(low_lims, start_vals - 10),
+  start_upper = start_vals + 10,
+  lower = low_lims,
+  upper = upper_lims,
+  supp_errors = 'Y'
+)
+
+thermal_params <- calc_params(fit_best) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+thermal_params
+```
+
+```{r}
+# Generate predictions for all fitted samples
+# 1. Create a fine sequence of temperature values for predictions
+temp_seq <- seq(min(ints$temp), max(ints$temp), length.out = 100)
+
+# 2. Predict rates across the temperature sequence using your fitted model
+preds <- data.frame(
+  temp = temp_seq,
+  rate = predict(fit_best, newdata = data.frame(temp = temp_seq))
+)
+
+# 3. Plot data points and predicted TPC curve
+ggplot() +
+  # Raw data points
+  geom_point(data = ints, aes(x = temp, y = rate), size = 3, color = "darkblue", alpha = 0.7) +
+  # Model fit curve
+  geom_line(data = preds, aes(x = temp, y = rate), color = "black", linewidth = 1.2) +
+  # Annotate optimum temperature (T_opt) on the plot
+  geom_vline(xintercept = thermal_params$topt, linetype = "dashed", color = "gray40") +
+  theme_classic(base_size = 14) +
+  labs(
+    x = "Temperature (°C)",
+    y = "Respiration Rate",
+    title = paste("Thermal Performance Curve:", best_model_name),
+    subtitle = paste0("Topt = ", thermal_params$topt, "°C | Rmax = ", thermal_params$rmax)
+  )
+```
+
+Bootstrap
+```{r}
+# 1. Setup prediction sequence and extraction parameters
+temp_seq <- seq(min(ints$temp), max(ints$temp), length.out = 100)
+fitted_vals <- predict(fit_best)
+resids <- residuals(fit_best)
+
+# 2. Run bootstrap iterations
+set.seed(123) # For reproducibility
+n_boot <- 200
+
+boot_preds <- map_dfc(1:n_boot, function(i) {
+  # Resample residuals and create bootstrapped response
+  boot_data <- ints
+  boot_data$rate <- fitted_vals + sample(resids, replace = TRUE)
+  
+  # Fit model to resampled data
+  boot_fit <- try(
+    nls_multstart(
+      best_formula,
+      data = boot_data,
+      iter = 100,
+      start_lower = pmax(low_lims, start_vals - 10),
+      start_upper = start_vals + 10,
+      lower = low_lims,
+      upper = upper_lims,
+      supp_errors = 'Y'
+    ),
+    silent = TRUE
+  )
+  
+  # Predict across temp_seq
+  if (!inherits(boot_fit, "try-error")) {
+    predict(boot_fit, newdata = data.frame(temp = temp_seq))
+  } else {
+    rep(NA, length(temp_seq))
+  }
+})
+
+# 3. Calculate 95% Confidence Interval bounds across temperature points
+preds <- data.frame(
+  temp = temp_seq,
+  rate = predict(fit_best, newdata = data.frame(temp = temp_seq)),
+  low_ci = apply(boot_preds, 1, quantile, probs = 0.025, na.rm = TRUE),
+  high_ci = apply(boot_preds, 1, quantile, probs = 0.975, na.rm = TRUE)
+)
+
+# 4. Plot with Confidence Interval Ribbon
+ggplot() +
+  geom_ribbon(data = preds, aes(x = temp, ymin = low_ci, ymax = high_ci), 
+              fill = "black", alpha = 0.2) +
+  geom_point(data = ints, aes(x = temp, y = rate), size = 3, color = "darkblue", alpha = 0.7) +
+  geom_line(data = preds, aes(x = temp, y = rate), color = "black", linewidth = 1.2) +
+  geom_vline(xintercept = thermal_params$topt, linetype = "dashed", color = "gray40") +
+  theme_classic(base_size = 14) +
+  labs(
+    x = "Temperature (°C)",
+    y = "Respiration Rate",
+    title = paste("Thermal Performance Curve:", best_model_name),
+    subtitle = paste0("Topt = ", thermal_params$topt, "°C | Rmax = ", thermal_params$rmax)
+  )
+```
+
+Look at weibull specifically (best model for continuous)
+```{r}
+# 1. Set model explicitly to Weibull 1995
+best_model_name <- "weibull_1995"
+
+# 2. Extract parameters and setup formula
+params <- setdiff(names(formals(get(best_model_name, asNamespace("rTPC")))), c("temp", "tref"))
+
+start_vals <- get_start_vals(ints$temp, ints$rate, model_name = best_model_name)
+low_lims   <- get_lower_lims(ints$temp, ints$rate, model_name = best_model_name)
+upper_lims <- get_upper_lims(ints$temp, ints$rate, model_name = best_model_name)
+
+if ("tref" %in% names(formals(get(best_model_name, asNamespace("rTPC"))))) {
+  param_str <- paste(c(params, "tref = 25"), collapse = ", ")
+} else {
+  param_str <- paste(params, collapse = ", ")
+}
+best_formula <- as.formula(sprintf("rate ~ %s(temp = temp, %s)", best_model_name, param_str))
+
+# 3. Fit the model
+fit_weibull <- nls_multstart(
+  best_formula,
+  data = ints,
+  iter = 500,
+  start_lower = pmax(low_lims, start_vals - 10),
+  start_upper = start_vals + 10,
+  lower = low_lims,
+  upper = upper_lims,
+  supp_errors = 'Y'
+)
+
+# 4. Calculate thermal parameters
+thermal_params <- calc_params(fit_weibull) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+print(thermal_params)
+
+# 5. Setup Bootstrap for 95% Confidence Intervals
+temp_seq <- seq(min(ints$temp), max(ints$temp), length.out = 100)
+fitted_vals <- predict(fit_weibull)
+resids <- residuals(fit_weibull)
+
+set.seed(123)
+n_boot <- 200
+
+boot_preds <- map_dfc(1:n_boot, function(i) {
+  boot_data <- ints
+  boot_data$rate <- fitted_vals + sample(resids, replace = TRUE)
+  
+  boot_fit <- try(
+    nls_multstart(
+      best_formula,
+      data = boot_data,
+      iter = 100,
+      start_lower = pmax(low_lims, start_vals - 10),
+      start_upper = start_vals + 10,
+      lower = low_lims,
+      upper = upper_lims,
+      supp_errors = 'Y'
+    ),
+    silent = TRUE
+  )
+  
+  if (!inherits(boot_fit, "try-error")) {
+    predict(boot_fit, newdata = data.frame(temp = temp_seq))
+  } else {
+    rep(NA, length(temp_seq))
+  }
+})
+
+# 6. Calculate prediction interval bounds
+preds <- data.frame(
+  temp = temp_seq,
+  rate = predict(fit_weibull, newdata = data.frame(temp = temp_seq)),
+  low_ci = apply(boot_preds, 1, quantile, probs = 0.025, na.rm = TRUE),
+  high_ci = apply(boot_preds, 1, quantile, probs = 0.975, na.rm = TRUE)
+)
+
+# 7. Final Plot
+ggplot() +
+  geom_ribbon(data = preds, aes(x = temp, ymin = low_ci, ymax = high_ci), 
+              fill = "black", alpha = 0.2) +
+  geom_point(data = ints, aes(x = temp, y = rate), size = 3, color = "darkblue", alpha = 0.7) +
+  geom_line(data = preds, aes(x = temp, y = rate), color = "black", linewidth = 1.2) +
+  geom_vline(xintercept = thermal_params$topt, linetype = "dashed", color = "gray40") +
+  theme_classic(base_size = 14) +
+  labs(
+    x = "Temperature (°C)",
+    y = "Respiration Rate",
+    title = paste("Thermal Performance Curve:", best_model_name),
+    subtitle = paste0("Topt = ", thermal_params$topt, "°C | Rmax = ", thermal_params$rmax)
+  )
+```
+
+## Lets try to fit GAMs 
+
+```{r}
+
+```
+
+
+
